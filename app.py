@@ -62,26 +62,40 @@ def load_forecaster(batch_size: int = 32):
 # Veri
 # --------------------------------------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
-    """Günlük kapanış serisi. period VEYA start/end verilir."""
+def fetch_prices(ticker: str, period=None, start=None, end=None):
+    """
+    Gunluk kapanis serisi + Yahoo chart metadata'si.
+
+    yf.download yerine Ticker.history kullaniyoruz: ayni istekte donen
+    metadata icinde borsanin o anki seans penceresi (currentTradingPeriod)
+    var, boylece acik/kapali tespiti icin ayri bir istek gerekmiyor.
+
+    Doner: (Series, meta_dict)
+    """
     kwargs = {"start": start, "end": end} if start else {"period": period}
     last_err = None
     for _ in range(3):
         try:
-            df = yf.download(
-                ticker,
+            tk = yf.Ticker(ticker)
+            df = tk.history(
                 interval="1d",
                 auto_adjust=True,
-                progress=False,
-                threads=False,
+                actions=False,
                 **kwargs,
             )
             if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
                     df.columns = df.columns.get_level_values(0)
                 s = df["Close"].dropna()
-                s.index = pd.to_datetime(s.index)
-                return s.astype("float64")
+                idx = pd.to_datetime(s.index)
+                if getattr(idx, "tz", None) is not None:
+                    idx = idx.tz_localize(None)
+                s.index = idx
+                try:
+                    md = tk.get_history_metadata() or {}
+                except Exception:  # noqa: BLE001
+                    md = {}
+                return s.astype("float64"), md
         except Exception as exc:  # noqa: BLE001
             last_err = exc
     raise RuntimeError(
@@ -90,9 +104,23 @@ def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
     )
 
 
+def meta_from_history(md: dict) -> dict:
+    """Chart metadata'sindan isim, borsa, para birimi ve seans penceresi."""
+    ctp = (md.get("currentTradingPeriod") or {}).get("regular") or {}
+    return {
+        "name": md.get("longName") or md.get("shortName") or "",
+        "type": md.get("instrumentType", ""),
+        "currency": md.get("currency", ""),
+        "exchange": md.get("fullExchangeName") or md.get("exchangeName", ""),
+        "tz": md.get("exchangeTimezoneName") or md.get("timezone") or "",
+        "session_start": ctp.get("start"),
+        "session_end": ctp.get("end"),
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def asset_info(ticker: str) -> dict:
-    """Doğru varlığı çektiğimizi teyit etmek için hafif meta bilgi."""
+    """Metadata eksik kalirsa yedek: .info (bulut IP'lerinde sik sik bos doner)."""
     try:
         info = yf.Ticker(ticker).get_info() or {}
     except Exception:  # noqa: BLE001
@@ -142,37 +170,65 @@ def session_status(index: pd.DatetimeIndex, meta: dict, override: str = "Otomati
     Son barin tamamlanmis bir seans mi yoksa devam eden gunun yarim bari mi
     oldugunu belirler.
 
-    Doner: (durum, hedef_gun, yarim_bar_var_mi)
+    Sirasiyla:
+      1. Yahoo chart metadata'sindaki seans penceresi (en guvenilir, tatilleri
+         de cozer: tatilde Yahoo bir sonraki seansi dondurur, simdi < start olur)
+      2. .info -> marketState (bulut IP'lerinde sik sik bos doner)
+      3. Son barin tarihi (acik/kapali ayrimi yapamaz -> "unknown")
+
+    Doner: (durum, hedef_gun, yarim_bar_var_mi, kaynak)
       durum: "open" | "closed" | "unknown"
     """
+    tz = meta.get("tz") or "UTC"
     try:
-        today = pd.Timestamp.now(tz=meta.get("tz") or "UTC").normalize().tz_localize(None)
+        now_local = pd.Timestamp.now(tz=tz)
     except Exception:  # noqa: BLE001
-        today = pd.Timestamp.utcnow().normalize()
+        now_local = pd.Timestamp.now(tz="UTC")
+        tz = "UTC"
+    today = now_local.normalize().tz_localize(None)
 
     last = pd.Timestamp(index[-1]).normalize()
     last_is_today = last == today
-    state = meta.get("market_state", "")
 
     if override == "Açık say":
-        return "open", (last if last_is_today else next_session_date(index)), last_is_today
+        return "open", (last if last_is_today else today), last_is_today, "elle"
     if override == "Kapalı say":
-        return "closed", next_session_date(index), False
+        return "closed", next_session_date(index), False, "elle"
 
-    # PRE: seans baslamadi, gunun bari henuz yok -> bugunu tahmin ediyoruz
+    # 1) Seans penceresi
+    s_start, s_end = meta.get("session_start"), meta.get("session_end")
+    if s_start and s_end:
+        try:
+            start_ts = pd.to_datetime(s_start, unit="s", utc=True).tz_convert(tz)
+            end_ts = pd.to_datetime(s_end, unit="s", utc=True).tz_convert(tz)
+            if start_ts <= now_local < end_ts:
+                # Seans devam ediyor; bugunun bari varsa yarimdir
+                target = start_ts.normalize().tz_localize(None)
+                return "open", target, last_is_today, "seans penceresi"
+            if now_local >= end_ts:
+                # Bugunku seans bitti -> son bar tamamlanmis
+                return "closed", next_session_date(index), False, "seans penceresi"
+            # now < start: seans henuz baslamadi (tatil de buraya duser)
+            target = start_ts.normalize().tz_localize(None)
+            if target > last:
+                return "closed", target, False, "seans penceresi"
+            return "closed", next_session_date(index), False, "seans penceresi"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # 2) marketState
+    state = meta.get("market_state", "")
     if state == "PRE":
-        return "open", (today if not last_is_today else last), last_is_today
-    # REGULAR: seans devam ediyor, bugunun bari varsa yarimdir
+        return "open", (today if not last_is_today else last), last_is_today, "marketState"
     if state == "REGULAR":
-        return "open", (last if last_is_today else today), last_is_today
-    # POST / CLOSED: son bar tamamlanmis
+        return "open", (last if last_is_today else today), last_is_today, "marketState"
     if state in ("POST", "CLOSED", "POSTPOST", "PREPRE"):
-        return "closed", next_session_date(index), False
+        return "closed", next_session_date(index), False, "marketState"
 
-    # marketState alinamadi
+    # 3) Son care
     if last_is_today:
-        return "unknown", last, True
-    return "closed", next_session_date(index), False
+        return "unknown", last, True, "tarih karşılaştırması"
+    return "closed", next_session_date(index), False, "tarih karşılaştırması"
 
 
 # --------------------------------------------------------------------------
@@ -314,9 +370,9 @@ try:
         if start_d >= end_d:
             st.error("Başlangıç tarihi bitişten önce olmalı.")
             st.stop()
-        prices = fetch_prices(ticker, start=str(start_d), end=str(end_d))
+        prices, hist_md = fetch_prices(ticker, start=str(start_d), end=str(end_d))
     else:
-        prices = fetch_prices(ticker, period=period)
+        prices, hist_md = fetch_prices(ticker, period=period)
 except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
@@ -335,8 +391,14 @@ if len(prices) < ctx_len:
     )
 
 # --- seans durumu: devam eden gunun yarim bari context'e girmemeli ---
-meta = asset_info(ticker)
-status, target_date, has_partial = session_status(prices.index, meta, session_override)
+meta = meta_from_history(hist_md)
+if not meta.get("session_start") or not meta.get("name"):
+    # metadata eksik: .info yedegini dene, sadece bos alanlari doldur
+    for k, v in asset_info(ticker).items():
+        if not meta.get(k):
+            meta[k] = v
+
+status, target_date, has_partial, src = session_status(prices.index, meta, session_override)
 
 live_price = None
 live_date = None
@@ -454,7 +516,7 @@ st.caption(
     f"10–90 bandı: {q10:,.4f} — {q90:,.4f} "
     f"({pct(qs[0]):+.2f}% / {pct(qs[-1]):+.2f}%) · "
     f"cihaz: {device} · context: {len(context)} gün · "
-    f"hedef gün {fmt_tr(target_date)} (resmi tatiller hesaba katılmaz)"
+    f"hedef gün {fmt_tr(target_date)} (seans kaynağı: {src})"
 )
 
 if confidence < 0.55:
