@@ -559,7 +559,7 @@ q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 nc = None
 nc_note = None
 if run_nc and status not in ("open", "pre"):
-    nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti."
+    nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti. ÇÖZÜM: AÇIK SAY SEÇ"
 elif run_nc:
     hourly = fetch_intraday(ticker, meta.get("tz", ""))
     if hourly is None or len(hourly) < 200:
