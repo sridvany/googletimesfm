@@ -236,8 +236,12 @@ def session_status(index: pd.DatetimeIndex, meta: dict, override: str = "Otomati
       2. .info -> marketState (bulut IP'lerinde sik sik bos doner)
       3. Son barin tarihi (acik/kapali ayrimi yapamaz -> "unknown")
 
-    Doner: (durum, hedef_gun, yarim_bar_var_mi, kaynak)
-      durum: "open" | "closed" | "unknown"
+    Doner: (durum, hedef_gun, yarim_bar_var_mi, kaynak, teshis)
+      durum: "open"    seans devam ediyor
+             "pre"     su an islem yok ama BUGUNUN kapanisi henuz gerceklesmedi
+                       (acilis oncesi veya ogle arasi) -> nowcast calisabilir
+             "closed"  gunun seansi bitti, hedef bir sonraki seans
+             "unknown" hicbir kaynak karar veremedi
     """
     tz = meta.get("tz") or "UTC"
     try:
@@ -250,10 +254,18 @@ def session_status(index: pd.DatetimeIndex, meta: dict, override: str = "Otomati
     last = pd.Timestamp(index[-1]).normalize()
     last_is_today = last == today
 
+    diag = {
+        "borsa saati": f"{now_local:%Y-%m-%d %H:%M} ({tz})",
+        "son günlük bar": f"{last:%Y-%m-%d}",
+        "son bar bugün mü": last_is_today,
+        "seans penceresi": "yok",
+        "marketState": meta.get("market_state") or "yok",
+    }
+
     if override == "Açık say":
-        return "open", (last if last_is_today else today), last_is_today, "elle"
+        return "open", (last if last_is_today else today), last_is_today, "elle", diag
     if override == "Kapalı say":
-        return "closed", next_session_date(index), False, "elle"
+        return "closed", next_session_date(index), False, "elle", diag
 
     # 1) Seans penceresi
     s_start, s_end = meta.get("session_start"), meta.get("session_end")
@@ -261,34 +273,38 @@ def session_status(index: pd.DatetimeIndex, meta: dict, override: str = "Otomati
         try:
             start_ts = pd.to_datetime(s_start, unit="s", utc=True).tz_convert(tz)
             end_ts = pd.to_datetime(s_end, unit="s", utc=True).tz_convert(tz)
+            diag["seans penceresi"] = f"{start_ts:%Y-%m-%d %H:%M} → {end_ts:%H:%M}"
+
             if start_ts <= now_local < end_ts:
-                # Seans devam ediyor; bugunun bari varsa yarimdir
-                target = start_ts.normalize().tz_localize(None)
-                return "open", target, last_is_today, "seans penceresi"
+                return ("open", start_ts.normalize().tz_localize(None),
+                        last_is_today, "seans penceresi", diag)
             if now_local >= end_ts:
-                # Bugunku seans bitti -> son bar tamamlanmis
-                return "closed", next_session_date(index), False, "seans penceresi"
-            # now < start: seans henuz baslamadi (tatil de buraya duser)
-            target = start_ts.normalize().tz_localize(None)
-            if target > last:
-                return "closed", target, False, "seans penceresi"
-            return "closed", next_session_date(index), False, "seans penceresi"
-        except Exception:  # noqa: BLE001
-            pass
+                return "closed", next_session_date(index), False, "seans penceresi", diag
+
+            # now < start: acilis oncesi, ogle arasi veya tatil.
+            # Pencere BUGUNE aitse gunun kapanisi hala onde -> nowcast calisabilir.
+            start_day = start_ts.normalize().tz_localize(None)
+            if start_day == today:
+                return "pre", today, last_is_today, "seans penceresi", diag
+            return "closed", start_day, False, "seans penceresi", diag
+        except Exception as exc:  # noqa: BLE001
+            diag["seans penceresi"] = f"hata: {exc}"
 
     # 2) marketState
     state = meta.get("market_state", "")
     if state == "PRE":
-        return "open", (today if not last_is_today else last), last_is_today, "marketState"
+        return ("pre", (today if not last_is_today else last),
+                last_is_today, "marketState", diag)
     if state == "REGULAR":
-        return "open", (last if last_is_today else today), last_is_today, "marketState"
+        return ("open", (last if last_is_today else today),
+                last_is_today, "marketState", diag)
     if state in ("POST", "CLOSED", "POSTPOST", "PREPRE"):
-        return "closed", next_session_date(index), False, "marketState"
+        return "closed", next_session_date(index), False, "marketState", diag
 
     # 3) Son care
     if last_is_today:
-        return "unknown", last, True, "tarih karşılaştırması"
-    return "closed", next_session_date(index), False, "tarih karşılaştırması"
+        return "unknown", last, True, "tarih karşılaştırması", diag
+    return "closed", next_session_date(index), False, "tarih karşılaştırması", diag
 
 
 # --------------------------------------------------------------------------
@@ -479,7 +495,9 @@ if not meta.get("session_start") or not meta.get("name"):
         if not meta.get(k):
             meta[k] = v
 
-status, target_date, has_partial, src = session_status(prices.index, meta, session_override)
+status, target_date, has_partial, src, diag = session_status(
+    prices.index, meta, session_override
+)
 
 live_price = None
 live_date = None
@@ -540,7 +558,7 @@ q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 # --- saatlik nowcast hesabi (once hesapla, sonra ozetle birlikte goster) ---
 nc = None
 nc_note = None
-if run_nc and status != "open":
+if run_nc and status not in ("open", "pre"):
     nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti."
 elif run_nc:
     hourly = fetch_intraday(ticker, meta.get("tz", ""))
@@ -611,6 +629,12 @@ if status == "open":
         f"🟢 **Borsa şu anda açık.** Tahminler **bugünün kapanışı** "
         f"({fmt_tr(target_date)}) içindir."
     )
+elif status == "pre":
+    st.success(
+        f"🟡 **Şu anda işlem yok** (açılış öncesi veya seans arası), ama bugünün "
+        f"kapanışı henüz gerçekleşmedi. Tahminler **bugünün kapanışı** "
+        f"({fmt_tr(target_date)}) içindir."
+    )
 elif status == "closed":
     st.error(
         f"🔴 **Borsa kapalı.** Tahminler **bir sonraki kapanış** "
@@ -621,6 +645,24 @@ else:
         f"🟡 **Borsa durumu belirlenemedi** (Yahoo seans bilgisi döndürmedi). "
         f"Seans devam ediyor varsayıldı, hedef gün {fmt_tr(target_date)}. "
         f"Yanlışsa soldan **Kapalı say**'ı seçin."
+    )
+
+with st.expander("🔧 Seans teşhisi — durum yanlışsa buraya bakın"):
+    st.write(
+        {
+            **diag,
+            "karar": status,
+            "kaynak": src,
+            "hedef gün": f"{target_date:%Y-%m-%d}",
+            "yarım bar atıldı": has_partial,
+            "borsa (meta)": meta.get("exchange") or "yok",
+            "saat dilimi (meta)": meta.get("tz") or "yok — UTC varsayıldı",
+        }
+    )
+    st.caption(
+        "Karar yanlışsa soldaki **Seans durumu** ile elle geçersiz kılın. "
+        "'seans penceresi' satırı Yahoo'nun bildirdiği seans; BIST'te öğle "
+        "arasında öğleden sonraki seans görünür, bu normaldir."
     )
 
 # ---- ozet: iki modeli yan yana ----
