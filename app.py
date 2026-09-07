@@ -1,5 +1,5 @@
 """
-TimesFM 3.0 ile bir sonraki islem gunu yon tahmini.
+TimesFM 3.0 ile bir sonraki islem gunu yön tahmini.
 
 Veri: yfinance (gunluk kapanis, split/temettu duzeltmeli)
 Model: google/timesfm-3.0-pytorch (zero-shot, fine-tuning yok)
@@ -91,29 +91,6 @@ def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def search_symbols(query: str, limit: int = 8):
-    """Isimden sembol arama (Yahoo arama ucu). Basarisiz olursa bos liste."""
-    try:
-        quotes = yf.Search(query, max_results=limit).quotes or []
-    except Exception:  # noqa: BLE001
-        return []
-    out = []
-    for q in quotes:
-        sym = q.get("symbol")
-        if not sym:
-            continue
-        out.append(
-            {
-                "symbol": sym,
-                "name": q.get("shortname") or q.get("longname") or "",
-                "type": q.get("quoteType", ""),
-                "exchange": q.get("exchDisp") or q.get("exchange", ""),
-            }
-        )
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def asset_info(ticker: str) -> dict:
     """Dogru varligi cektigimizi teyit etmek icin hafif meta bilgi."""
     try:
@@ -126,10 +103,6 @@ def asset_info(ticker: str) -> dict:
         "currency": info.get("currency", ""),
         "exchange": info.get("fullExchangeName") or info.get("exchange", ""),
     }
-
-
-def _set_ticker(symbol: str):
-    st.session_state["ticker"] = symbol
 
 
 def _apply_preset():
@@ -191,20 +164,11 @@ with st.sidebar:
         ),
     ).strip()
 
-    with st.expander("Isimden ara"):
-        query = st.text_input("Sirket / varlik adi", key="search_q")
-        if query:
-            hits = search_symbols(query)
-            if not hits:
-                st.caption("Sonuc yok veya arama ucu yanit vermedi.")
-            for h in hits:
-                st.button(
-                    f"{h['symbol']} — {h['name'] or '?'}  ·  {h['type']} {h['exchange']}",
-                    key=f"pick_{h['symbol']}",
-                    on_click=_set_ticker,
-                    args=(h["symbol"],),
-                    use_container_width=True,
-                )
+    st.caption(
+        "Sembolu bilmiyorsaniz "
+        "[Yahoo Finance Lookup](https://finance.yahoo.com/lookup) "
+        "sayfasindan bulup buraya yapistirin."
+    )
 
     with st.expander("Hazir listeden sec"):
         group = st.selectbox("Varlik sinifi", list(PRESETS), key="preset_group")
