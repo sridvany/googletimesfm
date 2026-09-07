@@ -21,12 +21,14 @@ import yfinance as yf
 MODEL_ID = "google/timesfm-3.0-pytorch"
 QUANTILE_LEVELS = np.arange(0.1, 0.91, 0.1)  # TimesFM 3.0 -> 9 quantile
 
-PRESETS = [
-    "AAPL", "MSFT", "NVDA", "SPY", "QQQ",
-    "BTC-USD", "ETH-USD",
-    "XU100.IS", "THYAO.IS", "GARAN.IS",
-    "GC=F", "CL=F", "EURUSD=X", "USDTRY=X",
-]
+PRESETS = {
+    "ABD hisse": ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA"],
+    "Endeks / ETF": ["SPY", "QQQ", "^GSPC", "^IXIC", "^VIX", "XU100.IS"],
+    "BIST": ["THYAO.IS", "GARAN.IS", "ASELS.IS", "EREGL.IS", "KCHOL.IS"],
+    "Kripto": ["BTC-USD", "ETH-USD", "SOL-USD"],
+    "Emtia": ["GC=F", "SI=F", "CL=F", "NG=F"],
+    "Doviz": ["EURUSD=X", "USDTRY=X", "GBPUSD=X", "USDJPY=X"],
+}
 
 st.set_page_config(page_title="TimesFM Yon Tahmini", page_icon="📈", layout="wide")
 
@@ -60,18 +62,19 @@ def load_forecaster(batch_size: int = 32):
 # Veri
 # --------------------------------------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_prices(ticker: str, period: str) -> pd.Series:
-    """Gunluk kapanis serisi. yfinance ara sira bos doner, 3 kez dener."""
+def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
+    """Gunluk kapanis serisi. period VEYA start/end verilir."""
+    kwargs = {"start": start, "end": end} if start else {"period": period}
     last_err = None
     for _ in range(3):
         try:
             df = yf.download(
                 ticker,
-                period=period,
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
                 threads=False,
+                **kwargs,
             )
             if df is not None and not df.empty:
                 if isinstance(df.columns, pd.MultiIndex):
@@ -85,6 +88,54 @@ def fetch_prices(ticker: str, period: str) -> pd.Series:
         f"'{ticker}' icin veri alinamadi. Sembolu kontrol edin "
         f"veya birkac dakika sonra tekrar deneyin. ({last_err})"
     )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_symbols(query: str, limit: int = 8):
+    """Isimden sembol arama (Yahoo arama ucu). Basarisiz olursa bos liste."""
+    try:
+        quotes = yf.Search(query, max_results=limit).quotes or []
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for q in quotes:
+        sym = q.get("symbol")
+        if not sym:
+            continue
+        out.append(
+            {
+                "symbol": sym,
+                "name": q.get("shortname") or q.get("longname") or "",
+                "type": q.get("quoteType", ""),
+                "exchange": q.get("exchDisp") or q.get("exchange", ""),
+            }
+        )
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def asset_info(ticker: str) -> dict:
+    """Dogru varligi cektigimizi teyit etmek icin hafif meta bilgi."""
+    try:
+        info = yf.Ticker(ticker).get_info() or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    return {
+        "name": info.get("longName") or info.get("shortName") or "",
+        "type": info.get("quoteType", ""),
+        "currency": info.get("currency", ""),
+        "exchange": info.get("fullExchangeName") or info.get("exchange", ""),
+    }
+
+
+def _set_ticker(symbol: str):
+    st.session_state["ticker"] = symbol
+
+
+def _apply_preset():
+    choice = st.session_state.get("preset")
+    if choice and choice != "—":
+        st.session_state["ticker"] = choice
 
 
 # --------------------------------------------------------------------------
@@ -127,14 +178,59 @@ def make_contexts(values: np.ndarray, ctx_len: int, n: int):
 # --------------------------------------------------------------------------
 st.title("📈 TimesFM 3.0 — Bir sonraki islem gunu yon tahmini")
 
+st.session_state.setdefault("ticker", "AAPL")
+
 with st.sidebar:
-    st.header("Ayarlar")
-    ticker = st.selectbox("Sembol", PRESETS, index=0, accept_new_options=True)
-    period = st.select_slider(
-        "Gecmis veri",
-        options=["1y", "2y", "5y", "10y", "max"],
-        value="5y",
-    )
+    st.header("Sembol")
+    ticker = st.text_input(
+        "yfinance sembolu",
+        key="ticker",
+        help=(
+            "Herhangi bir yfinance sembolu yazabilirsiniz. Ornekler: "
+            "AAPL · THYAO.IS · BTC-USD · GC=F · EURUSD=X · ^GSPC · VOD.L · 7203.T"
+        ),
+    ).strip()
+
+    with st.expander("Isimden ara"):
+        query = st.text_input("Sirket / varlik adi", key="search_q")
+        if query:
+            hits = search_symbols(query)
+            if not hits:
+                st.caption("Sonuc yok veya arama ucu yanit vermedi.")
+            for h in hits:
+                st.button(
+                    f"{h['symbol']} — {h['name'] or '?'}  ·  {h['type']} {h['exchange']}",
+                    key=f"pick_{h['symbol']}",
+                    on_click=_set_ticker,
+                    args=(h["symbol"],),
+                    use_container_width=True,
+                )
+
+    with st.expander("Hazir listeden sec"):
+        group = st.selectbox("Varlik sinifi", list(PRESETS), key="preset_group")
+        st.selectbox(
+            "Sembol",
+            ["—"] + PRESETS[group],
+            key="preset",
+            on_change=_apply_preset,
+        )
+
+    st.header("Veri")
+    custom_range = st.checkbox("Ozel tarih araligi", value=False)
+    if custom_range:
+        today = pd.Timestamp.today().normalize()
+        start_d = st.date_input("Baslangic", value=(today - pd.DateOffset(years=5)).date())
+        end_d = st.date_input("Bitis", value=today.date())
+        period = None
+    else:
+        period = st.select_slider(
+            "Gecmis veri",
+            options=["6mo", "1y", "2y", "5y", "10y", "max"],
+            value="5y",
+        )
+        start_d = end_d = None
+
+    st.header("Model")
     ctx_len = st.slider("Context uzunlugu (gun)", 128, 2048, 512, step=64)
     use_log = st.checkbox("Log fiyat uzerinde tahmin et", value=True)
     st.divider()
@@ -151,15 +247,34 @@ if not go:
     st.stop()
 
 # --- veri ---
+if not ticker:
+    st.error("Bir sembol girin.")
+    st.stop()
+
 try:
-    prices = fetch_prices(ticker, period)
+    if custom_range:
+        if start_d >= end_d:
+            st.error("Baslangic tarihi bitisten once olmali.")
+            st.stop()
+        prices = fetch_prices(ticker, start=str(start_d), end=str(end_d))
+    else:
+        prices = fetch_prices(ticker, period=period)
 except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
 
 if len(prices) < 130:
-    st.error(f"Yetersiz veri: {len(prices)} gozlem. Daha uzun bir donem secin.")
+    st.error(
+        f"Yetersiz veri: {len(prices)} gozlem. Daha uzun bir donem secin "
+        f"(en az 130 islem gunu gerekli)."
+    )
     st.stop()
+
+if len(prices) < ctx_len:
+    st.info(
+        f"Seride {len(prices)} gozlem var, context {ctx_len} gune ayarli. "
+        f"Model mevcut tum gecmisi kullanacak."
+    )
 
 raw = prices.values.astype("float64")
 series = np.log(raw) if use_log else raw
@@ -208,7 +323,16 @@ def pct(v: float) -> float:
 q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 
 # --- sonuc ---
-st.subheader(f"{ticker} — son kapanis {last_price:,.4f} ({prices.index[-1]:%Y-%m-%d})")
+meta = asset_info(ticker)
+label = f"{ticker}"
+if meta.get("name"):
+    label += f" — {meta['name']}"
+st.subheader(label)
+st.caption(
+    f"Son kapanis {last_price:,.4f} {meta.get('currency', '')} "
+    f"({prices.index[-1]:%Y-%m-%d}) · {meta.get('exchange', '')} "
+    f"· {len(prices)} gozlem"
+)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Yon", direction, f"{confidence * 100:.1f}% güven")
