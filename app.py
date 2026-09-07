@@ -95,7 +95,9 @@ def fetch_prices(ticker: str, period=None, start=None, end=None):
                     md = tk.get_history_metadata() or {}
                 except Exception:  # noqa: BLE001
                     md = {}
-                return s.astype("float64"), md
+                # Ham metadata pickle'lanamiyor (st.cache_data onu serilestirir),
+                # bu yuzden sadece duz alanlari cikarip donuyoruz.
+                return s.astype("float64"), meta_from_history(md)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
     raise RuntimeError(
@@ -105,16 +107,30 @@ def fetch_prices(ticker: str, period=None, start=None, end=None):
 
 
 def meta_from_history(md: dict) -> dict:
-    """Chart metadata'sindan isim, borsa, para birimi ve seans penceresi."""
+    """
+    Chart metadata'sindan isim, borsa, para birimi ve seans penceresi.
+    Sadece str/int/None doner: st.cache_data sonucu pickle'ladigi icin
+    ham metadata (DataFrame, tzinfo vb. icerir) dogrudan donulemez.
+    """
     ctp = (md.get("currentTradingPeriod") or {}).get("regular") or {}
+
+    def _int(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _str(v):
+        return str(v) if v else ""
+
     return {
-        "name": md.get("longName") or md.get("shortName") or "",
-        "type": md.get("instrumentType", ""),
-        "currency": md.get("currency", ""),
-        "exchange": md.get("fullExchangeName") or md.get("exchangeName", ""),
-        "tz": md.get("exchangeTimezoneName") or md.get("timezone") or "",
-        "session_start": ctp.get("start"),
-        "session_end": ctp.get("end"),
+        "name": _str(md.get("longName") or md.get("shortName")),
+        "type": _str(md.get("instrumentType")),
+        "currency": _str(md.get("currency")),
+        "exchange": _str(md.get("fullExchangeName") or md.get("exchangeName")),
+        "tz": _str(md.get("exchangeTimezoneName") or md.get("timezone")),
+        "session_start": _int(ctp.get("start")),
+        "session_end": _int(ctp.get("end")),
     }
 
 
@@ -370,9 +386,9 @@ try:
         if start_d >= end_d:
             st.error("Başlangıç tarihi bitişten önce olmalı.")
             st.stop()
-        prices, hist_md = fetch_prices(ticker, start=str(start_d), end=str(end_d))
+        prices, meta = fetch_prices(ticker, start=str(start_d), end=str(end_d))
     else:
-        prices, hist_md = fetch_prices(ticker, period=period)
+        prices, meta = fetch_prices(ticker, period=period)
 except RuntimeError as exc:
     st.error(str(exc))
     st.stop()
@@ -391,7 +407,6 @@ if len(prices) < ctx_len:
     )
 
 # --- seans durumu: devam eden gunun yarim bari context'e girmemeli ---
-meta = meta_from_history(hist_md)
 if not meta.get("session_start") or not meta.get("name"):
     # metadata eksik: .info yedegini dene, sadece bos alanlari doldur
     for k, v in asset_info(ticker).items():
