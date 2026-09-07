@@ -1,5 +1,5 @@
 """
-Google TimesFM  ile bir sonraki islem gunu yön tahmini.
+Google TimesFM ile bir sonraki islem gunu yön tahmini.
 
 Veri: yfinance (gunluk kapanis, split/temettu duzeltmeli)
 Model: google/timesfm-3.0-pytorch (zero-shot, fine-tuning yok)
