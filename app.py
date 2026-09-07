@@ -1,5 +1,5 @@
 """
-TimesFM 3.0 ile bir sonraki işlem günü yön tahmini.
+TimesFM ile bir sonraki işlem günü yön tahmini.
 
 Veri: yfinance (günlük kapanış, split/temettu duzeltmeli)
 Model: google/timesfm-3.0-pytorch (zero-shot, fine-tuning yok)
@@ -36,7 +36,7 @@ st.set_page_config(page_title="TimesFM Yön Tahmini", page_icon="📈", layout="
 # --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
-@st.cache_resource(show_spinner="TimesFM 3.0 yükleniyor (ilk çalıştırmada birkaç dakika)...")
+@st.cache_resource(show_spinner="TimesFM yükleniyor (ilk çalıştırmada birkaç dakika)...")
 def load_forecaster(batch_size: int = 32):
     import torch
     from timesfm3 import ModelConfig, TimesFM3Evaluator
@@ -285,7 +285,7 @@ def make_contexts(values: np.ndarray, ctx_len: int, n: int):
 # --------------------------------------------------------------------------
 # Arayüz
 # --------------------------------------------------------------------------
-st.title("📈 TimesFM 3.0 — Bir sonraki işlem günü yön tahmini")
+st.title("📈 TimesFM ile bir sonraki işlem günü yön tahmini")
 
 with st.expander("Bu uygulama ne yapıyor?", expanded=False):
     st.markdown(
