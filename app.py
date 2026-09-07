@@ -329,7 +329,7 @@ def make_contexts(values: np.ndarray, ctx_len: int, n: int):
 # --------------------------------------------------------------------------
 # Arayüz
 # --------------------------------------------------------------------------
-st.title("📈 TimesFM 3.0 ile bir sonraki işlem günü yön tahmini")
+st.title("📈 TimesFM 3.0 — Bir sonraki işlem günü yön tahmini")
 
 with st.expander("Bu uygulama ne yapıyor?", expanded=False):
     st.markdown(
@@ -537,6 +537,64 @@ def pct(v: float) -> float:
 
 q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 
+# --- saatlik nowcast hesabi (once hesapla, sonra ozetle birlikte goster) ---
+nc = None
+nc_note = None
+if run_nc and status != "open":
+    nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti."
+elif run_nc:
+    hourly = fetch_intraday(ticker, meta.get("tz", ""))
+    if hourly is None or len(hourly) < 200:
+        nc_note = (
+            "Bu sembol için saatlik veri alınamadı. Yahoo bazı borsalarda "
+            "(özellikle BIST'te) intraday veri vermiyor."
+        )
+    else:
+        h_dates, h_groups = session_bar_groups(hourly)
+        today_key = pd.Timestamp(target_date).normalize()
+        n_typ = typical_session_bars(h_groups, exclude=today_key)
+        today_pos = h_groups.get(today_key, np.array([], dtype=int))
+        k_elapsed = len(today_pos)
+
+        if n_typ <= 0 or k_elapsed == 0:
+            nc_note = (
+                "Bugüne ait saatlik bar henüz yok (seans yeni açılmış olabilir). "
+                "Nowcast için en az bir tamamlanmış saat gerekiyor."
+            )
+        else:
+            horizon_h = max(1, n_typ - k_elapsed)
+            h_log = np.log(hourly.values)
+            cut = int(today_pos[-1])
+            h_ctx = h_log[max(0, cut + 1 - nc_ctx): cut + 1].astype("float32")
+
+            with st.spinner(f"Saatlik nowcast: kalan {horizon_h} bar..."):
+                h_out = list(
+                    forecaster.predict_batch(
+                        [h_ctx], horizon=horizon_h,
+                        return_quantiles=True, use_symmetric_averaging=False,
+                    )
+                )[0]
+
+            hq = np.asarray(h_out.quantiles)[horizon_h - 1][:9]
+            hp = float(np.exp(np.asarray(h_out.forecast)[horizon_h - 1]))
+            cur = float(hourly.iloc[-1])
+            p = prob_above(hq, float(np.log(last_price)))
+            nc = {
+                "p_up": p,
+                "dir": "ARTACAK" if p >= 0.5 else "AZALACAK",
+                "p_from_now": prob_above(hq, float(np.log(cur))),
+                "q10": float(np.exp(hq[0])),
+                "q50": float(np.exp(hq[4])),
+                "q90": float(np.exp(hq[-1])),
+                "point": hp,
+                "cur": cur,
+                "k": k_elapsed,
+                "n": n_typ,
+                "horizon": horizon_h,
+                "ctx": len(h_ctx),
+                "last_bar": hourly.index[-1],
+            }
+
 # --- sonuc ---
 label = f"{ticker}"
 if meta.get("name"):
@@ -550,135 +608,128 @@ st.caption(
 
 if status == "open":
     st.success(
-        f"🟢 **Borsa şu anda açık.** Bugünün seansı ({fmt_tr(target_date)}) "
-        f"henüz kapanmadı; aşağıdaki tahmin **bugünün kapanışı** içindir."
+        f"🟢 **Borsa şu anda açık.** Tahminler **bugünün kapanışı** "
+        f"({fmt_tr(target_date)}) içindir."
     )
 elif status == "closed":
     st.error(
-        f"🔴 **Borsa kapalı.** Son seans tamamlandı; aşağıdaki tahmin "
-        f"**bir sonraki kapanış** ({fmt_tr(target_date)}) içindir."
+        f"🔴 **Borsa kapalı.** Tahminler **bir sonraki kapanış** "
+        f"({fmt_tr(target_date)}) içindir."
     )
 else:
     st.warning(
-        f"🟡 **Borsa durumu belirlenemedi** (Yahoo `marketState` döndürmedi). "
-        f"Son bar bugüne ait olduğu için seans devam ediyor varsayıldı ve "
-        f"hedef gün {fmt_tr(target_date)} alındı. Yanlışsa soldan "
-        f"**Kapalı say**'ı seçin."
+        f"🟡 **Borsa durumu belirlenemedi** (Yahoo seans bilgisi döndürmedi). "
+        f"Seans devam ediyor varsayıldı, hedef gün {fmt_tr(target_date)}. "
+        f"Yanlışsa soldan **Kapalı say**'ı seçin."
     )
 
-arrow = "🔺" if p_up >= 0.5 else "🔻"
-st.markdown(f"### {arrow} **{fmt_tr(target_date)}** kapanışı **{direction}**")
+# ---- ozet: iki modeli yan yana ----
+st.markdown(f"## {fmt_tr(target_date)} kapanışı")
+
+summary = [
+    {
+        "Model": "📅 Günlük",
+        "Yön": ("🔺 " if p_up >= 0.5 else "🔻 ") + direction,
+        "Artış olasılığı": f"{p_up * 100:.1f}%",
+        "Kapanış tahmini": f"{q50:,.4f}",
+        "10–90 bandı": f"{q10:,.4f} — {q90:,.4f}",
+        "Verisi nerede bitiyor": f"{prices.index[-1]:%d.%m} kapanışı — bugünü görmüyor",
+    }
+]
+if nc:
+    summary.append(
+        {
+            "Model": "⏱️ Saatlik",
+            "Yön": ("🔺 " if nc["p_up"] >= 0.5 else "🔻 ") + nc["dir"],
+            "Artış olasılığı": f"{nc['p_up'] * 100:.1f}%",
+            "Kapanış tahmini": f"{nc['q50']:,.4f}",
+            "10–90 bandı": f"{nc['q10']:,.4f} — {nc['q90']:,.4f}",
+            "Verisi nerede bitiyor": (
+                f"bugün {nc['last_bar']:%H:%M} — seansın {nc['k']}/{nc['n']} saati"
+            ),
+        }
+    )
+
+st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+st.caption(
+    "İki satırın da referansı aynı: **dünkü kapanışa göre** artış olasılığı. "
+    "Fark, modellerin ne kadar veri gördüğünde — sağdaki sütun."
+)
+
+if nc and nc["dir"] != direction:
+    st.warning(
+        f"**İki model çelişiyor:** günlük model **{direction}**, saatlik nowcast "
+        f"**{nc['dir']}** diyor. Bu bir hata değil, farklı bilgi kümeleri. "
+        f"Hangisine güveneceğini ekrana bakarak seçme; backtest'te bu sembolde "
+        f"hangisinin daha isabetli olduğuna bak."
+    )
+elif nc:
+    st.info(f"İki model de aynı yönde: **{direction}**.")
+
+if nc_note:
+    st.caption(f"⏱️ Saatlik nowcast çalışmadı: {nc_note}")
+
+# ---- detay: gunluk model ----
+st.divider()
+st.markdown("### 📅 Günlük model — detay")
+st.caption(
+    f"Günlük kapanış barlarıyla 1 adım ileri tahmin. Context {prices.index[-1]:%d.%m.%Y} "
+    f"kapanışında bitiyor; bugünün gün içi hareketini **görmüyor**."
+)
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Yön", direction, f"{confidence * 100:.1f}% güven")
-c2.metric("Artış olasılığı", f"{p_up * 100:.1f}%")
+c2.metric("Artış olasılığı", f"{p_up * 100:.1f}%", help="Dünkü kapanışa göre.")
 c3.metric("Medyan tahmin (q50)", f"{q50:,.4f}", f"{pct(qs[4]):+.2f}%")
 c4.metric("Nokta tahmin", f"{to_price(point):,.4f}", f"{pct(point):+.2f}%")
 
 if live_price is not None:
     intraday_pct = (live_price / last_price - 1.0) * 100.0
     live_val = float(np.log(live_price)) if use_log else live_price
-    p_up_from_now = prob_above(qs, live_val)
     d1, d2 = st.columns(2)
     d1.metric("Şu anki fiyat", f"{live_price:,.4f}", f"{intraday_pct:+.2f}% (gün içi)")
     d2.metric(
-        "Buradan yükselme olasılığı",
-        f"{p_up_from_now * 100:.1f}%",
-        help="P(kapanış > şu anki fiyat). Üstteki olasılık dünkü kapanışa göredir.",
-    )
-    st.info(
-        f"Model bugünün gün içi hareketini **görmedi**: context {fmt_tr(prices.index[-1])} "
-        f"kapanışında bitiyor, bugünkü yarım bar çıkarıldı. Yani bu tahmin, dün akşam "
-        f"yapılmış bir tahminle aynıdır; bugünkü {intraday_pct:+.2f}%'lik hareket "
-        f"sadece sağdaki olasılığın referans noktasına giriyor."
+        "Günlük model → buradan yükselme",
+        f"{prob_above(qs, live_val) * 100:.1f}%",
+        help="P(kapanış > şu anki fiyat), günlük modelin dağılımına göre.",
     )
 
 st.caption(
     f"10–90 bandı: {q10:,.4f} — {q90:,.4f} "
     f"({pct(qs[0]):+.2f}% / {pct(qs[-1]):+.2f}%) · "
-    f"cihaz: {device} · context: {len(context)} gün · "
-    f"hedef gün {fmt_tr(target_date)} (seans kaynağı: {src})"
+    f"cihaz: {device} · context: {len(context)} günlük bar · "
+    f"seans kaynağı: {src}"
 )
 
 if confidence < 0.55:
     st.warning(
-        "Olasılık %50'ye çok yakın. Bu, modelin yön konusunda pratikte "
-        "bilgi taşımadığı anlamına gelir — yön etiketini tek başına kullanmayın."
+        "Günlük modelin olasılığı %50'ye çok yakın — yön konusunda pratikte "
+        "bilgi taşımıyor. Yön etiketini tek başına kullanmayın."
     )
 
-# --- saatlik nowcast ---
-nc = None  # backtest bolumu de kullaniyor
-if run_nc and status == "open":
+# ---- detay: saatlik nowcast ----
+if nc:
     st.divider()
-    st.subheader("⏱️ Saatlik nowcast — bugünün kapanışı")
+    st.markdown("### ⏱️ Saatlik nowcast — detay")
+    st.caption(
+        f"Saatlik barlarla seansın kalan {nc['horizon']} barı tahmin edildi, "
+        f"son bar bugünün kapanışı sayıldı. Context bugün {nc['last_bar']:%H:%M} "
+        f"barında bitiyor; bugünün gerçekleşen hareketini **görüyor**."
+    )
 
-    hourly = fetch_intraday(ticker, meta.get("tz", ""))
-    if hourly is None or len(hourly) < 200:
-        st.info(
-            "Bu sembol için saatlik veri alınamadı. Yahoo bazı borsalarda "
-            "(özellikle BIST'te) intraday veri vermiyor; nowcast atlandı."
-        )
-    else:
-        h_dates, h_groups = session_bar_groups(hourly)
-        today_key = pd.Timestamp(target_date).normalize()
-        n_typ = typical_session_bars(h_groups, exclude=today_key)
-        today_pos = h_groups.get(today_key, np.array([], dtype=int))
-        k_elapsed = len(today_pos)
+    n1, n2, n3, n4 = st.columns(4)
+    n1.metric("Yön", nc["dir"], f"{max(nc['p_up'], 1 - nc['p_up']) * 100:.1f}% güven")
+    n2.metric("Artış olasılığı", f"{nc['p_up'] * 100:.1f}%", help="Dünkü kapanışa göre.")
+    n3.metric("Kapanış tahmini (q50)", f"{nc['q50']:,.4f}",
+              f"{(nc['q50'] / last_price - 1) * 100:+.2f}%")
+    n4.metric("Buradan yükselme", f"{nc['p_from_now'] * 100:.1f}%",
+              help="P(kapanış > şu anki fiyat), saatlik modelin dağılımına göre.")
 
-        if n_typ <= 0 or k_elapsed == 0:
-            st.info(
-                "Bugüne ait saatlik bar henüz yok (seans yeni açılmış olabilir). "
-                "Nowcast için en az bir tamamlanmış saat gerekiyor."
-            )
-        else:
-            horizon_h = max(1, n_typ - k_elapsed)
-            h_log = np.log(hourly.values)
-            cut = int(today_pos[-1])
-            h_ctx = h_log[max(0, cut + 1 - nc_ctx): cut + 1].astype("float32")
-
-            with st.spinner(f"Kalan {horizon_h} saat tahmin ediliyor..."):
-                h_out = list(
-                    forecaster.predict_batch(
-                        [h_ctx],
-                        horizon=horizon_h,
-                        return_quantiles=True,
-                        use_symmetric_averaging=False,
-                    )
-                )[0]
-
-            hq = np.asarray(h_out.quantiles)[horizon_h - 1][:9]
-            hp = float(np.asarray(h_out.forecast)[horizon_h - 1])
-            cur = float(hourly.iloc[-1])
-
-            nc_p_up = prob_above(hq, float(np.log(last_price)))
-            nc_p_from_now = prob_above(hq, float(np.log(cur)))
-            nc_dir = "ARTACAK" if nc_p_up >= 0.5 else "AZALACAK"
-            nc_q10, nc_q50, nc_q90 = (float(np.exp(hq[0])), float(np.exp(hq[4])),
-                                      float(np.exp(hq[-1])))
-            nc = {"dir": nc_dir, "p_up": nc_p_up}
-
-            n1, n2, n3, n4 = st.columns(4)
-            n1.metric("Yön (nowcast)", nc_dir, f"{max(nc_p_up, 1 - nc_p_up) * 100:.1f}% güven")
-            n2.metric("Artış olasılığı", f"{nc_p_up * 100:.1f}%",
-                      help="P(kapanış > dünkü kapanış), saatlik modele göre.")
-            n3.metric("Kapanış tahmini (q50)", f"{nc_q50:,.4f}",
-                      f"{(nc_q50 / last_price - 1) * 100:+.2f}%")
-            n4.metric("Buradan yükselme", f"{nc_p_from_now * 100:.1f}%",
-                      help="P(kapanış > şu anki fiyat).")
-
-            st.caption(
-                f"Seansın {k_elapsed}/{n_typ} saati geçti, kalan {horizon_h} bar tahmin "
-                f"edildi · 10–90 bandı: {nc_q10:,.4f} — {nc_q90:,.4f} · "
-                f"nokta: {float(np.exp(hp)):,.4f} · context: {len(h_ctx)} saatlik bar"
-            )
-
-            if nc_dir != direction:
-                st.warning(
-                    f"**İki model çelişiyor:** günlük model **{direction}**, saatlik "
-                    f"nowcast **{nc_dir}** diyor. Bu bir hata değil — farklı bilgi "
-                    f"kümeleri. Hangisine güveneceğini ekrana bakarak seçme; "
-                    f"backtest'te hangisinin bu sembolde daha iyi olduğuna bak."
-                )
+    st.caption(
+        f"Seansın {nc['k']}/{nc['n']} saati geçti · 10–90 bandı: "
+        f"{nc['q10']:,.4f} — {nc['q90']:,.4f} · nokta: {nc['point']:,.4f} · "
+        f"context: {nc['ctx']} saatlik bar"
+    )
 
 # --- grafik ---
 hist_n = min(120, len(prices))
