@@ -102,6 +102,8 @@ def asset_info(ticker: str) -> dict:
         "type": info.get("quoteType", ""),
         "currency": info.get("currency", ""),
         "exchange": info.get("fullExchangeName") or info.get("exchange", ""),
+        "market_state": (info.get("marketState") or "").upper(),
+        "tz": info.get("exchangeTimezoneName") or "",
     }
 
 
@@ -133,6 +135,44 @@ def next_session_date(index: pd.DatetimeIndex) -> pd.Timestamp:
     if (recent.dayofweek >= 5).mean() > 0.10:
         return last + pd.Timedelta(days=1)
     return last + pd.tseries.offsets.BDay(1)
+
+
+def session_status(index: pd.DatetimeIndex, meta: dict, override: str = "Otomatik"):
+    """
+    Son barin tamamlanmis bir seans mi yoksa devam eden gunun yarim bari mi
+    oldugunu belirler.
+
+    Doner: (durum, hedef_gun, yarim_bar_var_mi)
+      durum: "open" | "closed" | "unknown"
+    """
+    try:
+        today = pd.Timestamp.now(tz=meta.get("tz") or "UTC").normalize().tz_localize(None)
+    except Exception:  # noqa: BLE001
+        today = pd.Timestamp.utcnow().normalize()
+
+    last = pd.Timestamp(index[-1]).normalize()
+    last_is_today = last == today
+    state = meta.get("market_state", "")
+
+    if override == "Açık say":
+        return "open", (last if last_is_today else next_session_date(index)), last_is_today
+    if override == "Kapalı say":
+        return "closed", next_session_date(index), False
+
+    # PRE: seans baslamadi, gunun bari henuz yok -> bugunu tahmin ediyoruz
+    if state == "PRE":
+        return "open", (today if not last_is_today else last), last_is_today
+    # REGULAR: seans devam ediyor, bugunun bari varsa yarimdir
+    if state == "REGULAR":
+        return "open", (last if last_is_today else today), last_is_today
+    # POST / CLOSED: son bar tamamlanmis
+    if state in ("POST", "CLOSED", "POSTPOST", "PREPRE"):
+        return "closed", next_session_date(index), False
+
+    # marketState alinamadi
+    if last_is_today:
+        return "unknown", last, True
+    return "closed", next_session_date(index), False
 
 
 # --------------------------------------------------------------------------
@@ -238,6 +278,16 @@ with st.sidebar:
         )
         start_d = end_d = None
 
+    session_override = st.radio(
+        "Seans durumu",
+        ["Otomatik", "Açık say", "Kapalı say"],
+        horizontal=True,
+        help=(
+            "Otomatik: borsa durumu Yahoo'dan okunur. Yahoo yanıt vermezse "
+            "elle seçebilirsiniz."
+        ),
+    )
+
     st.header("Model")
     ctx_len = st.slider("Context uzunluğu (gün)", 128, 2048, 512, step=64)
     use_log = st.checkbox("Log fiyat üzerinde tahmin et", value=True)
@@ -283,6 +333,20 @@ if len(prices) < ctx_len:
         f"Seride {len(prices)} gözlem var, context {ctx_len} güne ayarlı. "
         f"Model mevcut tüm geçmişi kullanacak."
     )
+
+# --- seans durumu: devam eden gunun yarim bari context'e girmemeli ---
+meta = asset_info(ticker)
+status, target_date, has_partial = session_status(prices.index, meta, session_override)
+
+live_price = None
+live_date = None
+if has_partial:
+    live_price = float(prices.iloc[-1])
+    live_date = pd.Timestamp(prices.index[-1])
+    prices = prices.iloc[:-1]
+    if len(prices) < 130:
+        st.error("Yarım bar çıkarıldıktan sonra yetersiz veri kaldı.")
+        st.stop()
 
 raw = prices.values.astype("float64")
 series = np.log(raw) if use_log else raw
@@ -331,22 +395,36 @@ def pct(v: float) -> float:
 q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 
 # --- sonuc ---
-meta = asset_info(ticker)
 label = f"{ticker}"
 if meta.get("name"):
     label += f" — {meta['name']}"
 st.subheader(label)
 st.caption(
-    f"Son kapanış {last_price:,.4f} {meta.get('currency', '')} "
+    f"Son tamamlanmış kapanış {last_price:,.4f} {meta.get('currency', '')} "
     f"({fmt_tr(prices.index[-1])}) · {meta.get('exchange', '')} "
     f"· {len(prices)} gözlem"
 )
 
-next_date = next_session_date(prices.index)
+if status == "open":
+    st.success(
+        f"🟢 **Borsa şu anda açık.** Bugünün seansı ({fmt_tr(target_date)}) "
+        f"henüz kapanmadı; aşağıdaki tahmin **bugünün kapanışı** içindir."
+    )
+elif status == "closed":
+    st.error(
+        f"🔴 **Borsa kapalı.** Son seans tamamlandı; aşağıdaki tahmin "
+        f"**bir sonraki kapanış** ({fmt_tr(target_date)}) içindir."
+    )
+else:
+    st.warning(
+        f"🟡 **Borsa durumu belirlenemedi** (Yahoo `marketState` döndürmedi). "
+        f"Son bar bugüne ait olduğu için seans devam ediyor varsayıldı ve "
+        f"hedef gün {fmt_tr(target_date)} alındı. Yanlışsa soldan "
+        f"**Kapalı say**'ı seçin."
+    )
+
 arrow = "🔺" if p_up >= 0.5 else "🔻"
-st.markdown(
-    f"### {arrow} **{fmt_tr(next_date)}** günü kapanışı **{direction}**"
-)
+st.markdown(f"### {arrow} **{fmt_tr(target_date)}** kapanışı **{direction}**")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Yön", direction, f"{confidence * 100:.1f}% güven")
@@ -354,11 +432,29 @@ c2.metric("Artış olasılığı", f"{p_up * 100:.1f}%")
 c3.metric("Medyan tahmin (q50)", f"{q50:,.4f}", f"{pct(qs[4]):+.2f}%")
 c4.metric("Nokta tahmin", f"{to_price(point):,.4f}", f"{pct(point):+.2f}%")
 
+if live_price is not None:
+    intraday_pct = (live_price / last_price - 1.0) * 100.0
+    live_val = float(np.log(live_price)) if use_log else live_price
+    p_up_from_now = prob_above(qs, live_val)
+    d1, d2 = st.columns(2)
+    d1.metric("Şu anki fiyat", f"{live_price:,.4f}", f"{intraday_pct:+.2f}% (gün içi)")
+    d2.metric(
+        "Buradan yükselme olasılığı",
+        f"{p_up_from_now * 100:.1f}%",
+        help="P(kapanış > şu anki fiyat). Üstteki olasılık dünkü kapanışa göredir.",
+    )
+    st.info(
+        f"Model bugünün gün içi hareketini **görmedi**: context {fmt_tr(prices.index[-1])} "
+        f"kapanışında bitiyor, bugünkü yarım bar çıkarıldı. Yani bu tahmin, dün akşam "
+        f"yapılmış bir tahminle aynıdır; bugünkü {intraday_pct:+.2f}%'lik hareket "
+        f"sadece sağdaki olasılığın referans noktasına giriyor."
+    )
+
 st.caption(
     f"10–90 bandı: {q10:,.4f} — {q90:,.4f} "
     f"({pct(qs[0]):+.2f}% / {pct(qs[-1]):+.2f}%) · "
     f"cihaz: {device} · context: {len(context)} gün · "
-    f"hedef gün {fmt_tr(next_date)} (resmi tatiller hesaba katılmaz)"
+    f"hedef gün {fmt_tr(target_date)} (resmi tatiller hesaba katılmaz)"
 )
 
 if confidence < 0.55:
@@ -373,7 +469,7 @@ hist = pd.DataFrame(
     {"tarih": prices.index[-hist_n:], "fiyat": raw[-hist_n:], "tur": "geçmiş"}
 )
 fc = pd.DataFrame(
-    {"tarih": [next_date], "fiyat": [q50], "alt": [q10], "ust": [q90]}
+    {"tarih": [target_date], "fiyat": [q50], "alt": [q10], "ust": [q90]}
 )
 
 line = (
