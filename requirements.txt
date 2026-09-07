@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit>=1.42
+yfinance>=0.2.55
+timesfm[torch]==3.0.1
+numpy>=1.26
+pandas>=2.1
+altair>=5.0
