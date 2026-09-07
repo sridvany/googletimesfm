@@ -1,5 +1,5 @@
 """
-TimesFM ile bir sonraki işlem günü yön tahmini.
+TimesFM 3.0 ile bir sonraki işlem günü yön tahmini.
 
 Veri: yfinance (günlük kapanış, split/temettu duzeltmeli)
 Model: google/timesfm-3.0-pytorch (zero-shot, fine-tuning yok)
@@ -36,7 +36,7 @@ st.set_page_config(page_title="TimesFM Yön Tahmini", page_icon="📈", layout="
 # --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
-@st.cache_resource(show_spinner="TimesFM yükleniyor (ilk çalıştırmada birkaç dakika)...")
+@st.cache_resource(show_spinner="TimesFM 3.0 yükleniyor (ilk çalıştırmada birkaç dakika)...")
 def load_forecaster(batch_size: int = 32):
     import torch
     from timesfm3 import ModelConfig, TimesFM3Evaluator
@@ -104,6 +104,50 @@ def fetch_prices(ticker: str, period=None, start=None, end=None):
         f"'{ticker}' için veri alınamadı. Sembolü kontrol edin "
         f"veya birkaç dakika sonra tekrar deneyin. ({last_err})"
     )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(ticker: str, tz: str, interval: str = "60m", period: str = "730d"):
+    """
+    Saatlik kapanis serisi, borsanin saat diliminde. Yahoo 60m icin ~730 gun
+    veriyor. Basarisiz olursa None doner (nowcast paneli sessizce atlanir).
+    """
+    for _ in range(2):
+        try:
+            df = yf.Ticker(ticker).history(
+                period=period, interval=interval, auto_adjust=True, actions=False
+            )
+            if df is not None and not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                s = df["Close"].dropna()
+                idx = pd.to_datetime(s.index)
+                if getattr(idx, "tz", None) is None:
+                    idx = idx.tz_localize("UTC")
+                try:
+                    idx = idx.tz_convert(tz or "UTC")
+                except Exception:  # noqa: BLE001
+                    pass
+                s.index = idx
+                return s.astype("float64")
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def session_bar_groups(s: pd.Series):
+    """Gun -> o gune ait barlarin pozisyonlari."""
+    dates = pd.DatetimeIndex(s.index).tz_localize(None).normalize()
+    return dates, s.groupby(dates).indices
+
+
+def typical_session_bars(groups: dict, exclude=None) -> int:
+    """Tamamlanmis son ~10 seansin bar sayisi medyani."""
+    days = sorted(d for d in groups if d != exclude)
+    if not days:
+        return 0
+    counts = [len(groups[d]) for d in days[-11:-1]] or [len(groups[days[-1]])]
+    return int(np.median(counts))
 
 
 def meta_from_history(md: dict) -> dict:
@@ -285,7 +329,7 @@ def make_contexts(values: np.ndarray, ctx_len: int, n: int):
 # --------------------------------------------------------------------------
 # Arayüz
 # --------------------------------------------------------------------------
-st.title("📈 TimesFM ile bir sonraki işlem günü yön tahmini")
+st.title("📈 TimesFM 3.0 ile bir sonraki işlem günü yön tahmini")
 
 with st.expander("Bu uygulama ne yapıyor?", expanded=False):
     st.markdown(
@@ -363,9 +407,31 @@ with st.sidebar:
     st.header("Model")
     ctx_len = st.slider("Context uzunluğu (gün)", 128, 2048, 512, step=64)
     use_log = st.checkbox("Log fiyat üzerinde tahmin et", value=True)
+
+    st.header("Saatlik nowcast")
+    run_nc = st.checkbox(
+        "Seans içi saatlik tahmin",
+        value=True,
+        help=(
+            "Saatlik barlarla bugünün kapanışını tahmin eder. Günlük modelin "
+            "aksine bugünün gerçekleşen hareketini görür. Sadece borsa açıkken."
+        ),
+    )
+    nc_ctx = st.slider(
+        "Saatlik context (bar)", 128, 1024, 512, step=64, disabled=not run_nc
+    )
     st.divider()
     run_bt = st.checkbox("Backtest çalıştır", value=False)
     bt_days = st.slider("Backtest gün sayısı", 20, 250, 60, step=10, disabled=not run_bt)
+    bt_compare = st.checkbox(
+        "Saatlik nowcast'i de backtest et",
+        value=False,
+        disabled=not (run_bt and run_nc),
+        help=(
+            "Aynı hedef günlerde günlük model ile saatlik nowcast'i yan yana "
+            "ölçer. Her geçmiş seans, bugünkü ile aynı saatten kesilir."
+        ),
+    )
     st.divider()
     go = st.button("Tahmin et", type="primary", use_container_width=True)
 
@@ -540,6 +606,80 @@ if confidence < 0.55:
         "bilgi taşımadığı anlamına gelir — yön etiketini tek başına kullanmayın."
     )
 
+# --- saatlik nowcast ---
+nc = None  # backtest bolumu de kullaniyor
+if run_nc and status == "open":
+    st.divider()
+    st.subheader("⏱️ Saatlik nowcast — bugünün kapanışı")
+
+    hourly = fetch_intraday(ticker, meta.get("tz", ""))
+    if hourly is None or len(hourly) < 200:
+        st.info(
+            "Bu sembol için saatlik veri alınamadı. Yahoo bazı borsalarda "
+            "(özellikle BIST'te) intraday veri vermiyor; nowcast atlandı."
+        )
+    else:
+        h_dates, h_groups = session_bar_groups(hourly)
+        today_key = pd.Timestamp(target_date).normalize()
+        n_typ = typical_session_bars(h_groups, exclude=today_key)
+        today_pos = h_groups.get(today_key, np.array([], dtype=int))
+        k_elapsed = len(today_pos)
+
+        if n_typ <= 0 or k_elapsed == 0:
+            st.info(
+                "Bugüne ait saatlik bar henüz yok (seans yeni açılmış olabilir). "
+                "Nowcast için en az bir tamamlanmış saat gerekiyor."
+            )
+        else:
+            horizon_h = max(1, n_typ - k_elapsed)
+            h_log = np.log(hourly.values)
+            cut = int(today_pos[-1])
+            h_ctx = h_log[max(0, cut + 1 - nc_ctx): cut + 1].astype("float32")
+
+            with st.spinner(f"Kalan {horizon_h} saat tahmin ediliyor..."):
+                h_out = list(
+                    forecaster.predict_batch(
+                        [h_ctx],
+                        horizon=horizon_h,
+                        return_quantiles=True,
+                        use_symmetric_averaging=False,
+                    )
+                )[0]
+
+            hq = np.asarray(h_out.quantiles)[horizon_h - 1][:9]
+            hp = float(np.asarray(h_out.forecast)[horizon_h - 1])
+            cur = float(hourly.iloc[-1])
+
+            nc_p_up = prob_above(hq, float(np.log(last_price)))
+            nc_p_from_now = prob_above(hq, float(np.log(cur)))
+            nc_dir = "ARTACAK" if nc_p_up >= 0.5 else "AZALACAK"
+            nc_q10, nc_q50, nc_q90 = (float(np.exp(hq[0])), float(np.exp(hq[4])),
+                                      float(np.exp(hq[-1])))
+            nc = {"dir": nc_dir, "p_up": nc_p_up}
+
+            n1, n2, n3, n4 = st.columns(4)
+            n1.metric("Yön (nowcast)", nc_dir, f"{max(nc_p_up, 1 - nc_p_up) * 100:.1f}% güven")
+            n2.metric("Artış olasılığı", f"{nc_p_up * 100:.1f}%",
+                      help="P(kapanış > dünkü kapanış), saatlik modele göre.")
+            n3.metric("Kapanış tahmini (q50)", f"{nc_q50:,.4f}",
+                      f"{(nc_q50 / last_price - 1) * 100:+.2f}%")
+            n4.metric("Buradan yükselme", f"{nc_p_from_now * 100:.1f}%",
+                      help="P(kapanış > şu anki fiyat).")
+
+            st.caption(
+                f"Seansın {k_elapsed}/{n_typ} saati geçti, kalan {horizon_h} bar tahmin "
+                f"edildi · 10–90 bandı: {nc_q10:,.4f} — {nc_q90:,.4f} · "
+                f"nokta: {float(np.exp(hp)):,.4f} · context: {len(h_ctx)} saatlik bar"
+            )
+
+            if nc_dir != direction:
+                st.warning(
+                    f"**İki model çelişiyor:** günlük model **{direction}**, saatlik "
+                    f"nowcast **{nc_dir}** diyor. Bu bir hata değil — farklı bilgi "
+                    f"kümeleri. Hangisine güveneceğini ekrana bakarak seçme; "
+                    f"backtest'te hangisinin bu sembolde daha iyi olduğuna bak."
+                )
+
 # --- grafik ---
 hist_n = min(120, len(prices))
 hist = pd.DataFrame(
@@ -616,6 +756,80 @@ if run_bt:
         f"gerçek artış oranı: {bt['actual_up'].mean() * 100:.1f}%. "
         "Tek sembol ve kısa pencerede bu farklar büyük ölçüde gürültüdür."
     )
+
+    # --- ayni gunlerde saatlik nowcast karsilastirmasi ---
+    if bt_compare:
+        st.markdown("#### Günlük model vs saatlik nowcast")
+        hourly_bt = fetch_intraday(ticker, meta.get("tz", ""))
+        if hourly_bt is None or len(hourly_bt) < 500:
+            st.info("Saatlik veri yetersiz; karşılaştırma yapılamadı.")
+        else:
+            _, g = session_bar_groups(hourly_bt)
+            # bugunku seansta kac bar gectiyse gecmis seanslari da ayni yerden kes
+            today_key = pd.Timestamp(target_date).normalize()
+            k_cut = len(g.get(today_key, [])) or max(1, typical_session_bars(g) // 2)
+            h_log_bt = np.log(hourly_bt.values)
+
+            daily_dates = pd.DatetimeIndex(prices.index).normalize()
+            targets = [d for d in daily_dates[-bt_days:] if d in g and len(g[d]) > k_cut]
+
+            if len(targets) < 10:
+                st.info(
+                    f"Saatlik veriyle örtüşen yalnızca {len(targets)} gün var "
+                    f"(Yahoo 60m için ~730 gün veriyor). Karşılaştırma atlandı."
+                )
+            else:
+                ctxs, horizons, refs = [], [], []
+                for d in targets:
+                    idxs = g[d]
+                    cut = int(idxs[k_cut - 1])
+                    ctxs.append(
+                        h_log_bt[max(0, cut + 1 - nc_ctx): cut + 1].astype("float32")
+                    )
+                    horizons.append(len(idxs) - k_cut)
+                    pos = daily_dates.get_loc(d)
+                    refs.append((float(raw[pos - 1]), float(raw[pos])))
+
+                H = max(horizons)
+                with st.spinner(f"{len(ctxs)} seans için saatlik nowcast..."):
+                    h_preds = list(
+                        forecaster.predict_batch(
+                            ctxs, horizon=H,
+                            return_quantiles=True,
+                            use_symmetric_averaging=False,
+                        )
+                    )
+
+                nrows = []
+                for hzn, (prev_c, act_c), pr in zip(horizons, refs, h_preds):
+                    q = np.asarray(pr.quantiles)[hzn - 1][:9]
+                    pu = prob_above(q, float(np.log(prev_c)))
+                    nrows.append({"p_up": pu, "pred_up": pu >= 0.5,
+                                  "actual_up": act_c > prev_c})
+                nbt = pd.DataFrame(nrows)
+
+                n_acc = (nbt["pred_up"] == nbt["actual_up"]).mean()
+                n_brier = np.mean((nbt["p_up"] - nbt["actual_up"].astype(float)) ** 2)
+                n_base = max(nbt["actual_up"].mean(), 1 - nbt["actual_up"].mean())
+
+                cmp_df = pd.DataFrame(
+                    {
+                        "": ["Günlük model", "Saatlik nowcast", "Naif taban"],
+                        "Yönsel isabet": [f"{acc * 100:.1f}%", f"{n_acc * 100:.1f}%",
+                                          f"{n_base * 100:.1f}%"],
+                        "Brier": [f"{brier:.4f}", f"{n_brier:.4f}", "0.2500"],
+                        "Gün sayısı": [len(bt), len(nbt), len(nbt)],
+                    }
+                )
+                st.dataframe(cmp_df, hide_index=True, use_container_width=True)
+                st.caption(
+                    f"Her geçmiş seans, bugünkü ile aynı noktadan kesildi "
+                    f"({k_cut}. saatin sonunda) ve kalan barlar tahmin edildi. "
+                    f"İki satır farklı gün sayısı içerebilir: saatlik veri {len(nbt)} "
+                    f"günü kapsıyor, günlük backtest {len(bt)} günü. "
+                    f"Aradaki fark 3–4 puandan küçükse bu örneklem büyüklüğünde "
+                    f"anlamlı değildir."
+                )
 
 st.divider()
 st.caption(
