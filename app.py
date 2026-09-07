@@ -1,12 +1,12 @@
 """
-Google TimesFM ile bir sonraki islem gunu yön tahmini.
+TimesFM 3.0 ile bir sonraki işlem günü yön tahmini.
 
-Veri: yfinance (gunluk kapanis, split/temettu duzeltmeli)
+Veri: yfinance (günlük kapanış, split/temettu duzeltmeli)
 Model: google/timesfm-3.0-pytorch (zero-shot, fine-tuning yok)
-Cikti: artis olasiligi + 10-90 quantile bandi + yon etiketi
+Cikti: artış olasılığı + 10-90 quantile bandı + yön etiketi
 
-UYARI: Yatirim tavsiyesi degildir. Gunluk fiyat serileri random walk'a
-cok yakindir; yonsel isabet %50 civarinda beklenmelidir. Backtest
+UYARI: Yatirim tavsiyesi değildir. Günlük fiyat serileri random walk'a
+çok yakindir; yonsel isabet %50 civarinda beklenmelidir. Backtest
 sekmesi bunu kendi verinizde olcmeniz icindir.
 """
 
@@ -30,18 +30,18 @@ PRESETS = {
     "Doviz": ["EURUSD=X", "USDTRY=X", "GBPUSD=X", "USDJPY=X"],
 }
 
-st.set_page_config(page_title="TimesFM Yon Tahmini", page_icon="📈", layout="wide")
+st.set_page_config(page_title="TimesFM Yön Tahmini", page_icon="📈", layout="wide")
 
 
 # --------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------
-@st.cache_resource(show_spinner="TimesFM 3.0 yukleniyor (ilk calistirmada birkac dakika)...")
+@st.cache_resource(show_spinner="TimesFM 3.0 yükleniyor (ilk çalıştırmada birkaç dakika)...")
 def load_forecaster(batch_size: int = 32):
     import torch
     from timesfm3 import ModelConfig, TimesFM3Evaluator
 
-    # Gated repo: HF_TOKEN ortam degiskeni veya Streamlit secrets uzerinden
+    # Gated repo: HF_TOKEN ortam değişkeni veya Streamlit secrets üzerinden
     try:
         token = st.secrets.get("HF_TOKEN")
         if token:
@@ -63,7 +63,7 @@ def load_forecaster(batch_size: int = 32):
 # --------------------------------------------------------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
-    """Gunluk kapanis serisi. period VEYA start/end verilir."""
+    """Günlük kapanış serisi. period VEYA start/end verilir."""
     kwargs = {"start": start, "end": end} if start else {"period": period}
     last_err = None
     for _ in range(3):
@@ -85,14 +85,14 @@ def fetch_prices(ticker: str, period=None, start=None, end=None) -> pd.Series:
         except Exception as exc:  # noqa: BLE001
             last_err = exc
     raise RuntimeError(
-        f"'{ticker}' icin veri alinamadi. Sembolu kontrol edin "
-        f"veya birkac dakika sonra tekrar deneyin. ({last_err})"
+        f"'{ticker}' için veri alınamadı. Sembolü kontrol edin "
+        f"veya birkaç dakika sonra tekrar deneyin. ({last_err})"
     )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def asset_info(ticker: str) -> dict:
-    """Dogru varligi cektigimizi teyit etmek icin hafif meta bilgi."""
+    """Doğru varlığı çektiğimizi teyit etmek için hafif meta bilgi."""
     try:
         info = yf.Ticker(ticker).get_info() or {}
     except Exception:  # noqa: BLE001
@@ -111,13 +111,37 @@ def _apply_preset():
         st.session_state["ticker"] = choice
 
 
+TR_DAYS = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"]
+TR_MONTHS = [
+    "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+    "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
+]
+
+
+def fmt_tr(ts: pd.Timestamp) -> str:
+    return f"{ts.day} {TR_MONTHS[ts.month - 1]} {ts.year} {TR_DAYS[ts.dayofweek]}"
+
+
+def next_session_date(index: pd.DatetimeIndex) -> pd.Timestamp:
+    """
+    Tahminin ait oldugu gun. Seride hafta sonu gozlemi varsa (kripto, bazi FX)
+    piyasa 7/24 kabul edilir, yoksa bir sonraki is gunu alinir.
+    Resmi tatiller hesaba katilmaz.
+    """
+    last = pd.Timestamp(index[-1])
+    recent = index[-60:]
+    if (recent.dayofweek >= 5).mean() > 0.10:
+        return last + pd.Timedelta(days=1)
+    return last + pd.tseries.offsets.BDay(1)
+
+
 # --------------------------------------------------------------------------
-# Quantile -> olasilik
+# Quantile -> olasılık
 # --------------------------------------------------------------------------
 def prob_above(quantiles: np.ndarray, x: float) -> float:
     """
-    9 quantile'i ampirik CDF gibi kullanip P(Y > x) hesaplar.
-    Kuyruklarda en distaki iki quantile'in egimiyle dogrusal ekstrapolasyon.
+    9 quantile'i ampirik CDF gibi kullanıp P(Y > x) hesaplar.
+    Kuyruklarda en dıştaki iki quantile'in eğimiyle doğrusal ekstrapolasyon.
     """
     q = np.sort(np.asarray(quantiles, dtype="float64"))
     lv = QUANTILE_LEVELS
@@ -137,7 +161,7 @@ def prob_above(quantiles: np.ndarray, x: float) -> float:
 
 
 def make_contexts(values: np.ndarray, ctx_len: int, n: int):
-    """Son n gun icin kayan pencere: (context, onceki_deger, gercek_deger)."""
+    """Son n gün için kayan pencere: (context, onceki_deger, gercek_deger)."""
     T = len(values)
     out = []
     for i in range(T - n, T):
@@ -147,31 +171,51 @@ def make_contexts(values: np.ndarray, ctx_len: int, n: int):
 
 
 # --------------------------------------------------------------------------
-# Arayuz
+# Arayüz
 # --------------------------------------------------------------------------
-st.title("📈 TimesFM 3.0 — Bir sonraki islem gunu yon tahmini")
+st.title("📈 TimesFM 3.0 — Bir sonraki işlem günü yön tahmini")
+
+with st.expander("Bu uygulama ne yapıyor?", expanded=False):
+    st.markdown(
+        """
+**Veri:** yfinance — günlük kapanış, split ve temettü düzeltmeli.
+
+**Model:** `google/timesfm-3.0-pytorch` — zero-shot, fine-tuning yok.
+
+**Çıktı:** artış olasılığı + 10–90 quantile bandı + yön etiketi.
+
+Seçtiğiniz sembolün son N günlük kapanış serisini modele veriyor, bir sonraki
+işlem günü için 1 adımlık tahmin alıyor ve modelin döndürdüğü 9 quantile'ı
+ampirik dağılım gibi kullanarak `P(yarınki fiyat > bugünkü kapanış)` hesaplıyor.
+
+> **Uyarı:** Yatırım tavsiyesi değildir. Günlük fiyat serileri random walk'a
+> çok yakındır; yönsel isabet %50 civarında beklenmelidir. Backtest bölümü
+> bunu kendi verinizde ölçmeniz içindir — modelin "hep aynı yön" demenin
+> üstüne çıkıp çıkmadığına oradan bakın.
+        """
+    )
 
 st.session_state.setdefault("ticker", "AAPL")
 
 with st.sidebar:
     st.header("Sembol")
     ticker = st.text_input(
-        "yfinance sembolu",
+        "yfinance sembolü",
         key="ticker",
         help=(
-            "Herhangi bir yfinance sembolu yazabilirsiniz. Ornekler: "
+            "Herhangi bir yfinance sembolü yazabilirsiniz. Örnekler: "
             "AAPL · THYAO.IS · BTC-USD · GC=F · EURUSD=X · ^GSPC · VOD.L · 7203.T"
         ),
     ).strip()
 
     st.caption(
-        "Sembolu bilmiyorsaniz "
+        "Sembolü bilmiyorsanız "
         "[Yahoo Finance Lookup](https://finance.yahoo.com/lookup) "
-        "sayfasindan bulup buraya yapistirin."
+        "sayfasından bulup buraya yapıştırın."
     )
 
-    with st.expander("Hazir listeden sec"):
-        group = st.selectbox("Varlik sinifi", list(PRESETS), key="preset_group")
+    with st.expander("Hazır listeden seç"):
+        group = st.selectbox("Varlık sınıfı", list(PRESETS), key="preset_group")
         st.selectbox(
             "Sembol",
             ["—"] + PRESETS[group],
@@ -180,33 +224,33 @@ with st.sidebar:
         )
 
     st.header("Veri")
-    custom_range = st.checkbox("Ozel tarih araligi", value=False)
+    custom_range = st.checkbox("Özel tarih aralığı", value=False)
     if custom_range:
         today = pd.Timestamp.today().normalize()
-        start_d = st.date_input("Baslangic", value=(today - pd.DateOffset(years=5)).date())
-        end_d = st.date_input("Bitis", value=today.date())
+        start_d = st.date_input("Başlangıç", value=(today - pd.DateOffset(years=5)).date())
+        end_d = st.date_input("Bitiş", value=today.date())
         period = None
     else:
         period = st.select_slider(
-            "Gecmis veri",
+            "Geçmiş veri",
             options=["6mo", "1y", "2y", "5y", "10y", "max"],
             value="5y",
         )
         start_d = end_d = None
 
     st.header("Model")
-    ctx_len = st.slider("Context uzunlugu (gun)", 128, 2048, 512, step=64)
-    use_log = st.checkbox("Log fiyat uzerinde tahmin et", value=True)
+    ctx_len = st.slider("Context uzunluğu (gün)", 128, 2048, 512, step=64)
+    use_log = st.checkbox("Log fiyat üzerinde tahmin et", value=True)
     st.divider()
-    run_bt = st.checkbox("Backtest calistir", value=False)
-    bt_days = st.slider("Backtest gun sayisi", 20, 250, 60, step=10, disabled=not run_bt)
+    run_bt = st.checkbox("Backtest çalıştır", value=False)
+    bt_days = st.slider("Backtest gün sayısı", 20, 250, 60, step=10, disabled=not run_bt)
     st.divider()
     go = st.button("Tahmin et", type="primary", use_container_width=True)
 
 if not go:
     st.info(
-        "Soldan bir sembol secip **Tahmin et**'e basin. "
-        "Model ilk calistirmada Hugging Face'ten indirilir."
+        "Soldan bir sembol seçip **Tahmin et**'e basın. "
+        "Model ilk çalıştırmada Hugging Face'ten indirilir."
     )
     st.stop()
 
@@ -218,7 +262,7 @@ if not ticker:
 try:
     if custom_range:
         if start_d >= end_d:
-            st.error("Baslangic tarihi bitisten once olmali.")
+            st.error("Başlangıç tarihi bitişten önce olmalı.")
             st.stop()
         prices = fetch_prices(ticker, start=str(start_d), end=str(end_d))
     else:
@@ -229,15 +273,15 @@ except RuntimeError as exc:
 
 if len(prices) < 130:
     st.error(
-        f"Yetersiz veri: {len(prices)} gozlem. Daha uzun bir donem secin "
-        f"(en az 130 islem gunu gerekli)."
+        f"Yetersiz veri: {len(prices)} gözlem. Daha uzun bir dönem seçin "
+        f"(en az 130 işlem günü gerekli)."
     )
     st.stop()
 
 if len(prices) < ctx_len:
     st.info(
-        f"Seride {len(prices)} gozlem var, context {ctx_len} gune ayarli. "
-        f"Model mevcut tum gecmisi kullanacak."
+        f"Seride {len(prices)} gözlem var, context {ctx_len} güne ayarlı. "
+        f"Model mevcut tüm geçmişi kullanacak."
     )
 
 raw = prices.values.astype("float64")
@@ -251,14 +295,14 @@ try:
     forecaster, device = load_forecaster()
 except Exception as exc:  # noqa: BLE001
     st.error(
-        "Model yuklenemedi. TimesFM 3.0 agirliklari gated bir repoda; "
-        "HF_TOKEN tanimli mi ve lisansi kabul ettiniz mi kontrol edin.\n\n"
+        "Model yüklenemedi. TimesFM 3.0 ağırlıkları gated bir repoda; "
+        "HF_TOKEN tanımlı mi ve lisansı kabul ettiniz mi kontrol edin.\n\n"
         f"Hata: {exc}"
     )
     st.stop()
 
 # --- tahmin ---
-with st.spinner("Tahmin uretiliyor..."):
+with st.spinner("Tahmin üretiliyor..."):
     out = list(
         forecaster.predict_batch(
             [context],
@@ -293,35 +337,41 @@ if meta.get("name"):
     label += f" — {meta['name']}"
 st.subheader(label)
 st.caption(
-    f"Son kapanis {last_price:,.4f} {meta.get('currency', '')} "
-    f"({prices.index[-1]:%Y-%m-%d}) · {meta.get('exchange', '')} "
-    f"· {len(prices)} gozlem"
+    f"Son kapanış {last_price:,.4f} {meta.get('currency', '')} "
+    f"({fmt_tr(prices.index[-1])}) · {meta.get('exchange', '')} "
+    f"· {len(prices)} gözlem"
+)
+
+next_date = next_session_date(prices.index)
+arrow = "🔺" if p_up >= 0.5 else "🔻"
+st.markdown(
+    f"### {arrow} **{fmt_tr(next_date)}** günü kapanışı **{direction}**"
 )
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Yon", direction, f"{confidence * 100:.1f}% güven")
-c2.metric("Artis olasiligi", f"{p_up * 100:.1f}%")
+c1.metric("Yön", direction, f"{confidence * 100:.1f}% güven")
+c2.metric("Artış olasılığı", f"{p_up * 100:.1f}%")
 c3.metric("Medyan tahmin (q50)", f"{q50:,.4f}", f"{pct(qs[4]):+.2f}%")
 c4.metric("Nokta tahmin", f"{to_price(point):,.4f}", f"{pct(point):+.2f}%")
 
 st.caption(
-    f"10–90 bandi: {q10:,.4f} — {q90:,.4f} "
+    f"10–90 bandı: {q10:,.4f} — {q90:,.4f} "
     f"({pct(qs[0]):+.2f}% / {pct(qs[-1]):+.2f}%) · "
-    f"cihaz: {device} · context: {len(context)} gun"
+    f"cihaz: {device} · context: {len(context)} gün · "
+    f"hedef gün {fmt_tr(next_date)} (resmi tatiller hesaba katılmaz)"
 )
 
 if confidence < 0.55:
     st.warning(
-        "Olasilik %50'ye cok yakin. Bu, modelin yon konusunda pratikte "
-        "bilgi tasimadigi anlamina gelir — yon etiketini tek basina kullanmayin."
+        "Olasılık %50'ye çok yakın. Bu, modelin yön konusunda pratikte "
+        "bilgi taşımadığı anlamına gelir — yön etiketini tek başına kullanmayın."
     )
 
 # --- grafik ---
 hist_n = min(120, len(prices))
 hist = pd.DataFrame(
-    {"tarih": prices.index[-hist_n:], "fiyat": raw[-hist_n:], "tur": "gecmis"}
+    {"tarih": prices.index[-hist_n:], "fiyat": raw[-hist_n:], "tur": "geçmiş"}
 )
-next_date = prices.index[-1] + pd.tseries.offsets.BDay(1)
 fc = pd.DataFrame(
     {"tarih": [next_date], "fiyat": [q50], "alt": [q10], "ust": [q90]}
 )
@@ -352,7 +402,7 @@ with st.expander("Quantile tablosu"):
 # --- backtest ---
 if run_bt:
     st.divider()
-    st.subheader(f"Backtest — son {bt_days} islem gunu")
+    st.subheader(f"Backtest — son {bt_days} işlem günü")
 
     windows = make_contexts(series, ctx_len, bt_days)
     with st.spinner(f"{bt_days} pencere tek batch'te tahmin ediliyor..."):
@@ -372,31 +422,31 @@ if run_bt:
         rows.append(
             {
                 "p_up": pu,
-                "tahmin": pu >= 0.5,
-                "gercek": actual > prev,
+                "pred_up": pu >= 0.5,
+                "actual_up": actual > prev,
             }
         )
     bt = pd.DataFrame(rows)
 
-    acc = (bt["tahmin"] == bt["gercek"]).mean()
-    base = max(bt["gercek"].mean(), 1 - bt["gercek"].mean())
-    brier = np.mean((bt["p_up"] - bt["gercek"].astype(float)) ** 2)
+    acc = (bt["pred_up"] == bt["actual_up"]).mean()
+    base = max(bt["actual_up"].mean(), 1 - bt["actual_up"].mean())
+    brier = np.mean((bt["p_up"] - bt["actual_up"].astype(float)) ** 2)
 
     b1, b2, b3 = st.columns(3)
-    b1.metric("Yonsel isabet", f"{acc * 100:.1f}%")
-    b2.metric("Naif taban (hep ayni yon)", f"{base * 100:.1f}%", f"{(acc - base) * 100:+.1f} pp")
+    b1.metric("Yönsel isabet", f"{acc * 100:.1f}%")
+    b2.metric("Naif taban (hep aynı yön)", f"{base * 100:.1f}%", f"{(acc - base) * 100:+.1f} pp")
     b3.metric("Brier skoru", f"{brier:.4f}", "0.25 = rastgele", delta_color="off")
 
     st.caption(
-        "Brier skoru 0.25'in altindaysa olasilik tahmini rastgeleden iyidir. "
-        f"Ortalama artis olasiligi: {bt['p_up'].mean() * 100:.1f}%, "
-        f"gercek artis orani: {bt['gercek'].mean() * 100:.1f}%. "
-        "Tek sembol ve kisa pencerede bu farklar buyuk olcude gurultudur."
+        "Brier skoru 0.25'in altındaysa olasılık tahmini rastgeleden iyidir. "
+        f"Ortalama artış olasılığı: {bt['p_up'].mean() * 100:.1f}%, "
+        f"gerçek artış oranı: {bt['actual_up'].mean() * 100:.1f}%. "
+        "Tek sembol ve kısa pencerede bu farklar büyük ölçüde gürültüdür."
     )
 
 st.divider()
 st.caption(
-    "Bu uygulama arastirma ve egitim amaclidir, **yatirim tavsiyesi degildir**. "
-    "TimesFM 3.0 agirliklari `timesfm-non-commercial-license-v1.0` altindadir; "
-    "ticari veya produksiyon kullanimi izinli degildir."
+    "Bu uygulama araştırma ve eğitim amaçlıdır, **yatırım tavsiyesi değildir**. "
+    "TimesFM 3.0 ağırlıkları `timesfm-non-commercial-license-v1.0` altındadır; "
+    "ticari veya prodüksiyon kullanımı izinli değildir."
 )
