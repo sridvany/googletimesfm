@@ -559,7 +559,7 @@ q10, q50, q90 = to_price(qs[0]), to_price(qs[4]), to_price(qs[-1])
 nc = None
 nc_note = None
 if run_nc and status not in ("open", "pre"):
-    nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti. ÇÖZÜM: AÇIK SAY SEÇ"
+    nc_note = "Borsa kapalı olduğu için saatlik nowcast çalışmadı — bugünün seansı zaten bitti."
 elif run_nc:
     hourly = fetch_intraday(ticker, meta.get("tz", ""))
     if hourly is None or len(hourly) < 200:
@@ -610,7 +610,8 @@ elif run_nc:
                 "n": n_typ,
                 "horizon": horizon_h,
                 "ctx": len(h_ctx),
-                "last_bar": hourly.index[-1],
+                "first_bar": hourly.index[cut + 1 - len(h_ctx)],
+                "last_bar": hourly.index[cut],
             }
 
 # --- sonuc ---
@@ -668,34 +669,45 @@ with st.expander("🔧 Seans teşhisi — durum yanlışsa buraya bakın"):
 # ---- ozet: iki modeli yan yana ----
 st.markdown(f"## {fmt_tr(target_date)} kapanışı")
 
-summary = [
-    {
-        "Model": "📅 Günlük",
-        "Yön": ("🔺 " if p_up >= 0.5 else "🔻 ") + direction,
-        "Artış olasılığı": f"{p_up * 100:.1f}%",
-        "Kapanış tahmini": f"{q50:,.4f}",
-        "10–90 bandı": f"{q10:,.4f} — {q90:,.4f}",
-        "Verisi nerede bitiyor": f"{prices.index[-1]:%d.%m} kapanışı — bugünü görmüyor",
-    }
+ctx_start_d = prices.index[-len(context)]
+ctx_end_d = prices.index[-1]
+
+fields = [
+    "Yön",
+    "Artış olasılığı",
+    "Kapanış tahmini (q50)",
+    "10–90 bandı",
+    "Veri tipi",
+    "Veri aralığı (context)",
+    "Bar sayısı",
 ]
+daily_col = [
+    ("🔺 " if p_up >= 0.5 else "🔻 ") + direction,
+    f"{p_up * 100:.1f}%",
+    f"{q50:,.4f}",
+    f"{q10:,.4f} — {q90:,.4f}",
+    "Günlük kapanış (1d)",
+    f"{ctx_start_d:%d.%m.%Y} → {ctx_end_d:%d.%m.%Y}",
+    f"{len(context)} bar",
+]
+
+summary = {"": fields, "📅 Günlük model": daily_col}
 if nc:
-    summary.append(
-        {
-            "Model": "⏱️ Saatlik",
-            "Yön": ("🔺 " if nc["p_up"] >= 0.5 else "🔻 ") + nc["dir"],
-            "Artış olasılığı": f"{nc['p_up'] * 100:.1f}%",
-            "Kapanış tahmini": f"{nc['q50']:,.4f}",
-            "10–90 bandı": f"{nc['q10']:,.4f} — {nc['q90']:,.4f}",
-            "Verisi nerede bitiyor": (
-                f"bugün {nc['last_bar']:%H:%M} — seansın {nc['k']}/{nc['n']} saati"
-            ),
-        }
-    )
+    summary["⏱️ Saatlik nowcast"] = [
+        ("🔺 " if nc["p_up"] >= 0.5 else "🔻 ") + nc["dir"],
+        f"{nc['p_up'] * 100:.1f}%",
+        f"{nc['q50']:,.4f}",
+        f"{nc['q10']:,.4f} — {nc['q90']:,.4f}",
+        "Saatlik kapanış (60m)",
+        f"{nc['first_bar']:%d.%m.%Y %H:%M} → {nc['last_bar']:%d.%m.%Y %H:%M}",
+        f"{nc['ctx']} bar",
+    ]
 
 st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
 st.caption(
-    "İki satırın da referansı aynı: **dünkü kapanışa göre** artış olasılığı. "
-    "Fark, modellerin ne kadar veri gördüğünde — sağdaki sütun."
+    "**Artış olasılığı** her iki sütunda da dünkü kapanışa göredir. Aradaki fark "
+    "**veri aralığı** satırından geliyor: günlük model dünkü kapanışta duruyor, "
+    "saatlik model bugünün gerçekleşen barlarını da görüyor."
 )
 
 if nc and nc["dir"] != direction:
